@@ -1,27 +1,29 @@
 import torch
-from lightning.fabric import Fabric
 
-from model import DeepfakeDetectionModel
-from config import Config
+from cvsp.models.lnclip_df.model import DeepfakeDetectionModel
+from cvsp.models.lnclip_df.config import Config
+
+_PRECISION_TO_DTYPE = {
+    "bf16": torch.bfloat16,
+    "bf16-mixed": torch.bfloat16,
+    "16": torch.float16,
+    "16-mixed": torch.float16,
+}
 
 
-def make_model(
-    checkpoint_path,
-    device: torch.Device = "cpu",
-):
+def make_model(checkpoint_path, device="cpu"):
     ckpt = torch.load(checkpoint_path, map_location=device)
-    run_name = ckpt["hyper_parameters"]["run_name"]
 
     model = DeepfakeDetectionModel(Config(**ckpt["hyper_parameters"]))
-    model.eval()
     model.load_state_dict(ckpt["state_dict"])
+    model.eval()
 
+    precision = ckpt["hyper_parameters"].get("precision", "32")
+    dtype = _PRECISION_TO_DTYPE.get(precision)
+    if dtype is not None:
+        model = model.to(dtype)
+
+    model = model.to(device)
     preprocessing = model.get_preprocessing()
-
-    precision = ckpt["hyper_parameters"]["precision"]
-    fabric = Fabric(precision=precision)
-    fabric.launch()
-
-    model = fabric.setup_module(model)
 
     return model, preprocessing

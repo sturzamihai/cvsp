@@ -8,6 +8,8 @@ import cv2
 import gradio as gr
 import numpy as np
 import torch
+import torch.nn as nn
+import torchattacks
 from PIL import Image
 
 ROOT = Path(__file__).parent.parent
@@ -16,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from cvsp.preprocessing import extract_aligned_face_dlib
 from cvsp.models.lnclip_df.model import DeepfakeDetectionModel
 from cvsp.models.lnclip_df.config import Config as LNClipConfig
+from cvsp.models.minifas import FaceAntiSpoofing
 
 import dlib
 
@@ -57,6 +60,23 @@ def _load_lnclip():
 
 _detector, _predictor = _load_dlib()
 _lnclip, _lnclip_preprocess = _load_lnclip()
+_antispoof = FaceAntiSpoofing()
+
+
+class _LogitsWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        return self.model(x).logits_labels
+
+
+_pgd_attack = (
+    torchattacks.PGD(_LogitsWrapper(_lnclip), eps=8 / 255, alpha=2 / 255, steps=25)
+    if _lnclip is not None
+    else None
+)
 
 
 def _scale_for_detection(rgb: np.ndarray) -> tuple[np.ndarray, float]:
@@ -117,6 +137,22 @@ def _annotate_rgb(rgb: np.ndarray) -> np.ndarray:
     return out
 
 
+def _get_largest_dlib_face(rgb: np.ndarray) -> dlib.rectangle | None:
+    """Returns the largest dlib face rect scaled back to full-res coordinates."""
+    small, scale = _scale_for_detection(rgb)
+    faces = list(_detector(small, 1))
+    if not faces:
+        return None
+    face = max(faces, key=lambda f: f.width() * f.height())
+    inv = 1.0 / scale
+    return dlib.rectangle(
+        int(face.left() * inv),
+        int(face.top() * inv),
+        int(face.right() * inv),
+        int(face.bottom() * inv),
+    )
+
+
 def _get_aligned_pil(rgb: np.ndarray) -> Image.Image | None:
     """
     Run the full DFB alignment pipeline on one RGB frame.
@@ -133,11 +169,15 @@ def _get_aligned_pil(rgb: np.ndarray) -> Image.Image | None:
     return Image.fromarray(cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB))
 
 
-@torch.no_grad()
-def _run_lnclip(pil_images: list[Image.Image]) -> torch.Tensor:
+def _run_lnclip(pil_images: list[Image.Image], apply_attack: bool = False) -> torch.Tensor:
     """Returns (N, 2) softmax probabilities [P(REAL), P(FAKE)]."""
     tensors = torch.stack([_lnclip_preprocess(img) for img in pil_images])
-    return _lnclip(tensors).logits_labels.softmax(dim=1)
+    if apply_attack and _pgd_attack is not None:
+        # Label 1 = FAKE; PGD maximises loss for this label, pushing predictions toward REAL
+        labels = torch.ones(len(tensors), dtype=torch.long)
+        tensors = _pgd_attack(tensors, labels)
+    with torch.no_grad():
+        return _lnclip(tensors).logits_labels.softmax(dim=1)
 
 
 def _reencode_h264(src: str) -> str:
@@ -172,7 +212,7 @@ def _to_label(probs: list[float]) -> dict:
     return {"REAL": float(probs[0]), "FAKE": float(probs[1])}
 
 
-def process_video(video_path: str, progress=gr.Progress()):
+def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progress()):
     if video_path is None:
         return None, None, "No video provided."
 
@@ -210,6 +250,7 @@ def process_video(video_path: str, progress=gr.Progress()):
     )
 
     aligned_pils: list[Image.Image] = []
+    spoof_results: list[tuple[bool, float]] = []
     frames_processed = 0
 
     progress(0, desc="Annotating frames…")
@@ -226,10 +267,16 @@ def process_video(video_path: str, progress=gr.Progress()):
             out_bgr = cv2.resize(out_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
         writer.write(out_bgr)
 
-        if frames_processed in sample_idxs and _lnclip is not None:
-            aligned = _get_aligned_pil(rgb)
-            if aligned is not None:
-                aligned_pils.append(aligned)
+        if frames_processed in sample_idxs:
+            dlib_face = _get_largest_dlib_face(rgb)
+            if dlib_face is not None:
+                spoof = _antispoof(rgb, dlib_face)
+                if spoof is not None:
+                    spoof_results.append(spoof)
+            if _lnclip is not None:
+                aligned = _get_aligned_pil(rgb)
+                if aligned is not None:
+                    aligned_pils.append(aligned)
 
         frames_processed += 1
         if total > 0:
@@ -242,9 +289,21 @@ def process_video(video_path: str, progress=gr.Progress()):
     output_path = _reencode_h264(raw_tmp.name)
 
     label_out = None
+    spoof_label_out = None
     stats_parts = [
         f"Frames: {frames_processed} total, {len(aligned_pils)} sampled with faces.",
     ]
+
+    if spoof_results:
+        avg_live = sum(score for _, score in spoof_results) / len(spoof_results)
+        spoof_label_out = {"LIVE": avg_live, "SPOOF": 1.0 - avg_live}
+        verdict_spoof = "SPOOF" if avg_live < 0.5 else "LIVE"
+        stats_parts.append(
+            f"Anti-spoof: {verdict_spoof}  |  LIVE {avg_live:.1%} / SPOOF {1-avg_live:.1%}"
+            f"  ({len(spoof_results)} frames checked)"
+        )
+    else:
+        stats_parts.append("Anti-spoof: no face matched across detectors.")
 
     if not aligned_pils:
         stats_parts.append("No faces detected in sampled frames — classifier skipped.")
@@ -252,7 +311,7 @@ def process_video(video_path: str, progress=gr.Progress()):
         stats_parts.append("LNCLIP-DF model not loaded.")
     else:
         progress(0.93, desc="Running LNCLIP-DF…")
-        avg = _run_lnclip(aligned_pils).mean(dim=0).tolist()
+        avg = _run_lnclip(aligned_pils, apply_attack=apply_attack).mean(dim=0).tolist()
         label_out = _to_label(avg)
         verdict = "FAKE" if avg[1] > 0.5 else "REAL"
         stats_parts.append(
@@ -260,7 +319,7 @@ def process_video(video_path: str, progress=gr.Progress()):
         )
 
     progress(1.0)
-    return output_path, label_out, "\n".join(stats_parts)
+    return output_path, label_out, spoof_label_out, "\n".join(stats_parts)
 
 
 _status = (
@@ -285,16 +344,23 @@ with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
         )
         video_out = gr.Video(label="Annotated output", interactive=False)
 
-    analyze_btn = gr.Button("Analyze", variant="primary")
+    with gr.Row():
+        analyze_btn = gr.Button("Analyze", variant="primary")
+        attack_toggle = gr.Checkbox(
+            label="Apply adversarial attack",
+            value=False,
+            info="Applies PGD perturbation to sampled frames to evade the deepfake detector. Enable for deepfake videos.",
+        )
 
     with gr.Row():
-        verdict_label = gr.Label(num_top_classes=2, label="LNCLIP-DF verdict")
+        spoof_label = gr.Label(num_top_classes=2, label="Anti-spoof (MiniFAS)")
+        verdict_label = gr.Label(num_top_classes=2, label="Deepfake (LNCLIP-DF)")
         verdict_stats = gr.Textbox(label="Details", interactive=False, lines=3)
 
     analyze_btn.click(
         fn=process_video,
-        inputs=[video_in],
-        outputs=[video_out, verdict_label, verdict_stats],
+        inputs=[video_in, attack_toggle],
+        outputs=[video_out, verdict_label, spoof_label, verdict_stats],
     )
 
 

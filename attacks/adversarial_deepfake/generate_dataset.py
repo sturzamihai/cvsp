@@ -31,7 +31,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
 
-from cvsp.models.lnclip_df import make_model as make_deepfake_model
+from cvsp.models.lnclip_df import load_model as make_deepfake_model
 
 EPS = 8 / 255
 ALPHA = 2 / 255

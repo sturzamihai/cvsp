@@ -100,23 +100,28 @@ def create_logger(log_path):
     return logger
 
 
-def get_keypts(image, face, predictor, face_detector):
-    # detect the facial landmarks for the selected face
+def get_keypts(image, face, predictor, face_detector, use_eye_centers=False):
     shape = predictor(image, face)
 
-    # select the key points for the eyes, nose, and mouth
-    leye = np.array([shape.part(37).x, shape.part(37).y]).reshape(-1, 2)
-    reye = np.array([shape.part(44).x, shape.part(44).y]).reshape(-1, 2)
-    nose = np.array([shape.part(30).x, shape.part(30).y]).reshape(-1, 2)
-    lmouth = np.array([shape.part(49).x, shape.part(49).y]).reshape(-1, 2)
-    rmouth = np.array([shape.part(55).x, shape.part(55).y]).reshape(-1, 2)
+    if use_eye_centers:
+        # Average full eye contours — matches MTCNN's eye-center landmarks
+        leye = np.mean([[shape.part(i).x, shape.part(i).y] for i in range(36, 42)], axis=0).reshape(-1, 2)
+        reye = np.mean([[shape.part(i).x, shape.part(i).y] for i in range(42, 48)], axis=0).reshape(-1, 2)
+        lmouth = np.array([shape.part(48).x, shape.part(48).y]).reshape(-1, 2)
+        rmouth = np.array([shape.part(54).x, shape.part(54).y]).reshape(-1, 2)
+    else:
+        leye = np.array([shape.part(37).x, shape.part(37).y]).reshape(-1, 2)
+        reye = np.array([shape.part(44).x, shape.part(44).y]).reshape(-1, 2)
+        lmouth = np.array([shape.part(49).x, shape.part(49).y]).reshape(-1, 2)
+        rmouth = np.array([shape.part(55).x, shape.part(55).y]).reshape(-1, 2)
 
+    nose = np.array([shape.part(30).x, shape.part(30).y]).reshape(-1, 2)
     pts = np.concatenate([leye, reye, nose, lmouth, rmouth], axis=0)
 
     return pts
 
 
-def extract_aligned_face_dlib(face_detector, predictor, image, res=256, mask=None):
+def extract_aligned_face_dlib(face_detector, predictor, image, res=256, mask=None, scale=1.3, use_eye_centers=False):
     def img_align_crop(img, landmark=None, outsize=None, scale=1.3, mask=None):
         """
         align and crop the face according to the given bbox and landmarks
@@ -191,11 +196,11 @@ def extract_aligned_face_dlib(face_detector, predictor, image, res=256, mask=Non
         face = max(faces, key=lambda rect: rect.width() * rect.height())
 
         # Get the landmarks/parts for the face in box d only with the five key points
-        landmarks = get_keypts(rgb, face, predictor, face_detector)
+        landmarks = get_keypts(rgb, face, predictor, face_detector, use_eye_centers=use_eye_centers)
 
         # Align and crop the face
         cropped_face, mask_face = img_align_crop(
-            rgb, landmarks, outsize=(res, res), mask=mask
+            rgb, landmarks, outsize=(res, res), scale=scale, mask=mask
         )
         cropped_face = cv2.cvtColor(cropped_face, cv2.COLOR_RGB2BGR)
 

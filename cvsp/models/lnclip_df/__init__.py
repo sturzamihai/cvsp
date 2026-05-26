@@ -11,7 +11,7 @@ _PRECISION_TO_DTYPE = {
 }
 
 
-def make_model(checkpoint_path, device="cpu"):
+def load_model(checkpoint_path, device="cpu"):
     ckpt = torch.load(checkpoint_path, map_location=device)
 
     model = DeepfakeDetectionModel(Config(**ckpt["hyper_parameters"]))

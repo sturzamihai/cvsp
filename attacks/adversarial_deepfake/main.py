@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 import torchattacks
-from cvsp.models.lnclip_df import make_model as make_deepfake_model
+from cvsp.models.lnclip_df import load_model as make_deepfake_model
 
 
 class LogitsWrapper(nn.Module):

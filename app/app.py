@@ -6,9 +6,15 @@ import gradio as gr
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 import torchattacks
 from PIL import Image
+
+try:
+    import insightface
+    from insightface.app import FaceAnalysis as InsightFaceAnalysis
+    _insightface_available = True
+except ImportError:
+    _insightface_available = False
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -16,13 +22,12 @@ sys.path.insert(0, str(ROOT))
 from cvsp.preprocessing import extract_aligned_face_dlib
 from cvsp.models.lnclip_df import load_model as load_lnclip_model
 from cvsp.models.minifas import FaceAntiSpoofing
-from cvsp.models.flip import load_model as load_flip_model
 
 import dlib
 
 PREDICTOR_PATH = ROOT / "weights" / "shape_predictor_81_face_landmarks.dat"
 LNCLIP_CKPT = ROOT / "weights" / "lnclip.ckpt"
-FLIP_CKPT = ROOT / "weights" / "wmca_flip_mcl.pth.tar"
+INSWAPPER_PATH = ROOT / "weights" / "inswapper_128.onnx"
 BATCH_SIZE = 48  # frames averaged per verdict
 
 
@@ -40,8 +45,22 @@ def _load_dlib():
 
 _detector, _predictor = _load_dlib()
 _lnclip, _lnclip_preprocess = load_lnclip_model(LNCLIP_CKPT)
-_flip, _flip_preprocess = load_flip_model(FLIP_CKPT)
 _antispoof = FaceAntiSpoofing()
+
+_fa_app = None
+_swapper = None
+
+
+def _get_deepfake_models():
+    global _fa_app, _swapper
+    if not _insightface_available:
+        return None, None
+    if _fa_app is None:
+        _fa_app = InsightFaceAnalysis()
+        _fa_app.prepare(ctx_id=0)
+    if _swapper is None and INSWAPPER_PATH.exists():
+        _swapper = insightface.model_zoo.get_model(str(INSWAPPER_PATH))
+    return _fa_app, _swapper
 
 
 class _LogitsWrapper(nn.Module):
@@ -61,7 +80,6 @@ _pgd_attack = (
 
 
 def _get_largest_dlib_face(rgb: np.ndarray) -> dlib.rectangle | None:
-    """Returns the largest dlib face rect in full-res coordinates."""
     faces = list(_detector(rgb, 1))
     if not faces:
         return None
@@ -71,12 +89,6 @@ def _get_largest_dlib_face(rgb: np.ndarray) -> dlib.rectangle | None:
 def _get_aligned_pil(
     rgb: np.ndarray, scale: float = 1.3, use_eye_centers: bool = False
 ) -> Image.Image | None:
-    """
-    Run the full DFB alignment pipeline on one RGB frame.
-    Alignment runs on the original full-resolution frame so the 256×256 crop
-    matches the quality of the offline training preprocessing.
-    Returns a PIL Image (RGB) or None if no face found.
-    """
     if _predictor is None:
         return None
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -101,30 +113,23 @@ def _run_lnclip(
         return _lnclip(tensors).logits_labels.softmax(dim=1)
 
 
-def _run_flip(pil_images: list[Image.Image]) -> torch.Tensor:
-    """Returns (N, 1) softmax probabilities [0 = fake, 1 = true]."""
-    tensors = torch.stack([_flip_preprocess(img) for img in pil_images])
-
-    with torch.no_grad():
-        cls_out, _ = _flip.forward_eval(tensors, True)
-    print(
-        f"[FLIP] raw logits mean: spoof={cls_out[:,0].mean():.3f} real={cls_out[:,1].mean():.3f}"
-    )
-    return F.softmax(cls_out, dim=1).cpu().data.numpy()[:, 1]
-
-
 def _to_label(probs: list[float]) -> dict:
-    """Format [p_real, p_fake] for gr.Label."""
     return {"REAL": float(probs[0]), "FAKE": float(probs[1])}
 
 
-def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progress()):
+def process_video(
+    video_path: str,
+    apply_attack: bool = False,
+    apply_deepfake: bool = False,
+    target_image: np.ndarray | None = None,
+    progress=gr.Progress(),
+):
     if video_path is None:
-        return None, None, None, [], []
+        return None, None, []
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return None, None, None, [], []
+        return None, None, []
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -139,12 +144,24 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
         cap.release()
         cap = cv2.VideoCapture(video_path)
 
+    # Prepare deepfake source face once before the frame loop
+    source_face = None
+    fa_app = None
+    swapper = None
+    if apply_deepfake and target_image is not None:
+        fa_app, swapper = _get_deepfake_models()
+        if fa_app is not None and swapper is not None:
+            # Gradio returns RGB numpy arrays; insightface expects BGR
+            target_bgr = cv2.cvtColor(target_image, cv2.COLOR_RGB2BGR)
+            faces = fa_app.get(target_bgr)
+            if faces:
+                source_face = faces[0]
+
     # Sample BATCH_SIZE indices uniformly
     n_samples = min(BATCH_SIZE, max(total, 1))
     sample_idxs = set(np.linspace(0, total - 1, n_samples, dtype=int).tolist())
 
     aligned_pils: list[Image.Image] = []
-    flip_pils: list[Image.Image] = []
     spoof_results: list[tuple[bool, float]] = []
     frames_processed = 0
 
@@ -155,6 +172,11 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
             break
 
         if frames_processed in sample_idxs:
+            if source_face is not None:
+                frame_faces = fa_app.get(bgr)
+                if frame_faces:
+                    bgr = swapper.get(bgr, frame_faces[0], source_face, paste_back=True)
+
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             dlib_face = _get_largest_dlib_face(rgb)
             if dlib_face is not None:
@@ -164,9 +186,6 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
             aligned = _get_aligned_pil(rgb)
             if aligned is not None:
                 aligned_pils.append(aligned)
-            flip_aligned = _get_aligned_pil(rgb, scale=1.0, use_eye_centers=True)
-            if flip_aligned is not None:
-                flip_pils.append(flip_aligned)
 
         frames_processed += 1
         if total > 0:
@@ -175,7 +194,6 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
     cap.release()
 
     lnclip_label_out = None
-    flip_label_out = None
     minifas_label_out = None
 
     if spoof_results:
@@ -187,23 +205,18 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
         avg = _run_lnclip(aligned_pils, apply_attack=apply_attack).mean(dim=0).tolist()
         lnclip_label_out = _to_label(avg)
 
-    if flip_pils and _flip is not None:
-        progress(0.95, desc="Running FLIP...")
-        avg = _run_flip(flip_pils).mean(axis=0).tolist()
-        flip_label_out = {"SPOOFED": 1 - avg, "LIVE": avg}
-
     progress(1.0)
 
     max_preview = 8
     lnclip_preview = aligned_pils[::max(1, len(aligned_pils) // max_preview)][:max_preview]
-    flip_preview = flip_pils[::max(1, len(flip_pils) // max_preview)][:max_preview]
 
-    return lnclip_label_out, flip_label_out, minifas_label_out, lnclip_preview, flip_preview
+    return lnclip_label_out, minifas_label_out, lnclip_preview
 
 
 _status = (
     f"dlib: **{'✓' if PREDICTOR_PATH.exists() else '✗ not found'}**  |  "
-    f"LNCLIP-DF: **{'✓' if _lnclip is not None else '✗ not loaded'}**"
+    f"LNCLIP-DF: **{'✓' if _lnclip is not None else '✗ not loaded'}**  |  "
+    f"Deepfake swap: **{'✓' if _insightface_available and INSWAPPER_PATH.exists() else '✗ not available'}**"
 )
 
 with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
@@ -216,36 +229,48 @@ with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
         f"probabilities for a video-level deepfake verdict."
     )
 
-    video_in = gr.Video(
-        sources=["webcam", "upload"],
-        label="Input — record or upload",
-    )
-
     with gr.Row():
-        analyze_btn = gr.Button("Analyze", variant="primary")
-        attack_toggle = gr.Checkbox(
-            label="Apply adversarial attack",
-            value=False,
-            info="Applies PGD perturbation to sampled frames to evade the deepfake detector. Enable for deepfake videos.",
+        video_in = gr.Video(
+            sources=["webcam", "upload"],
+            label="Input — record or upload",
         )
+        with gr.Column():
+            attack_toggle = gr.Checkbox(
+                label="Apply adversarial attack",
+                value=False,
+                info="Applies PGD perturbation to sampled frames to evade the deepfake detector.",
+            )
+            deepfake_toggle = gr.Checkbox(
+                label="Apply deepfake",
+                value=False,
+                info="Swaps faces in the video with the target face using inswapper.",
+            )
+            target_image = gr.Image(
+                label="Target face",
+                type="numpy",
+                visible=False,
+            )
+
+    analyze_btn = gr.Button("Analyze", variant="primary")
 
     with gr.Row():
         verdict_label = gr.Label(num_top_classes=2, label="Deepfake (LNCLIP-DF)")
-        flip_label = gr.Label(num_top_classes=2, label="Presentation Attack (FLIP)")
         minifas_label = gr.Label(num_top_classes=2, label="Presentation Attack (MiniFAS)")
 
-    with gr.Row():
-        lnclip_gallery = gr.Gallery(
-            label="LNCLIP-DF aligned crops", columns=8, height=160, object_fit="cover"
-        )
-        flip_gallery = gr.Gallery(
-            label="FLIP aligned crops", columns=8, height=160, object_fit="cover"
-        )
+    lnclip_gallery = gr.Gallery(
+        label="LNCLIP-DF aligned crops", columns=8, height=160, object_fit="cover"
+    )
+
+    deepfake_toggle.change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[deepfake_toggle],
+        outputs=[target_image],
+    )
 
     analyze_btn.click(
         fn=process_video,
-        inputs=[video_in, attack_toggle],
-        outputs=[verdict_label, flip_label, minifas_label, lnclip_gallery, flip_gallery],
+        inputs=[video_in, attack_toggle, deepfake_toggle, target_image],
+        outputs=[verdict_label, minifas_label, lnclip_gallery],
     )
 
 

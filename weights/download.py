@@ -22,10 +22,19 @@ def download_dlib_predictor(
     return str(dst)
 
 
+def dowload_inswapper(
+    url="https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx",
+):
+    dst = Path("inswapper_128.onnx")
+    urllib.request.urlretrieve(url, dst)
+    return str(dst)
+
+
 if __name__ == "__main__":
     required_downloads = {
         "LNCLIP-DF": download_lnclip_df,
         "DLIB Shape Predictor": download_dlib_predictor,
+        "InSwapper 128": dowload_inswapper,
     }
 
     for key, value in required_downloads.items():

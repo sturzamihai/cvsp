@@ -1,7 +1,4 @@
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -24,9 +21,7 @@ import dlib
 
 PREDICTOR_PATH = ROOT / "weights" / "shape_predictor_81_face_landmarks.dat"
 LNCLIP_CKPT = ROOT / "weights" / "lnclip.ckpt"
-BATCH_SIZE = 32  # frames averaged per verdict
-DETECT_WIDTH = 640  # downscale to this width before dlib HOG (speedup on HD+)
-MAX_OUT_WIDTH = 1280  # cap annotated-video output width
+BATCH_SIZE = 48  # frames averaged per verdict
 
 
 def _load_dlib():
@@ -79,97 +74,33 @@ _pgd_attack = (
 )
 
 
-def _scale_for_detection(rgb: np.ndarray) -> tuple[np.ndarray, float]:
-    """Return a downscaled copy capped at DETECT_WIDTH and the scale factor used."""
-    h, w = rgb.shape[:2]
-    if w <= DETECT_WIDTH:
-        return rgb, 1.0
-    scale = DETECT_WIDTH / w
-    small = cv2.resize(
-        rgb, (DETECT_WIDTH, int(h * scale)), interpolation=cv2.INTER_AREA
-    )
-    return small, scale
-
-
-def _annotate_rgb(rgb: np.ndarray) -> np.ndarray:
-    """
-    Draw bounding boxes on an RGB frame.
-    Detection runs on a downscaled copy (DETECT_WIDTH) for speed; boxes are
-    scaled back to original resolution before drawing.
-    """
-    small, scale = _scale_for_detection(rgb)
-    faces = list(_detector(small, 1))
-    out = rgb.copy()
-
-    if not faces:
-        cv2.putText(
-            out,
-            "No face detected",
-            (10, 36),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 80, 80),
-            2,
-        )
-        return out
-
-    largest_idx = max(
-        range(len(faces)),
-        key=lambda i: faces[i].width() * faces[i].height(),
-    )
-    inv = 1.0 / scale
-    for i, face in enumerate(faces):
-        x1 = max(0, int(face.left() * inv))
-        y1 = max(0, int(face.top() * inv))
-        x2 = min(rgb.shape[1] - 1, int(face.right() * inv))
-        y2 = min(rgb.shape[0] - 1, int(face.bottom() * inv))
-        color = (80, 220, 80) if i == largest_idx else (255, 165, 0)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            out,
-            "main" if i == largest_idx else "face",
-            (x1, max(y1 - 6, 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-        )
-    return out
-
-
 def _get_largest_dlib_face(rgb: np.ndarray) -> dlib.rectangle | None:
-    """Returns the largest dlib face rect scaled back to full-res coordinates."""
-    small, scale = _scale_for_detection(rgb)
-    faces = list(_detector(small, 1))
+    """Returns the largest dlib face rect in full-res coordinates."""
+    faces = list(_detector(rgb, 1))
     if not faces:
         return None
-    face = max(faces, key=lambda f: f.width() * f.height())
-    inv = 1.0 / scale
-    return dlib.rectangle(
-        int(face.left() * inv),
-        int(face.top() * inv),
-        int(face.right() * inv),
-        int(face.bottom() * inv),
-    )
+    return max(faces, key=lambda f: f.width() * f.height())
 
 
 def _get_aligned_pil(rgb: np.ndarray) -> Image.Image | None:
     """
     Run the full DFB alignment pipeline on one RGB frame.
-    Downscales to DETECT_WIDTH before detection; output crop is still 256×256.
+    Alignment runs on the original full-resolution frame so the 256×256 crop
+    matches the quality of the offline training preprocessing.
     Returns a PIL Image (RGB) or None if no face found.
     """
     if _predictor is None:
         return None
-    small, _ = _scale_for_detection(rgb)
-    bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     cropped_bgr, _, _ = extract_aligned_face_dlib(_detector, _predictor, bgr)
     if cropped_bgr is None:
         return None
     return Image.fromarray(cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB))
 
 
-def _run_lnclip(pil_images: list[Image.Image], apply_attack: bool = False) -> torch.Tensor:
+def _run_lnclip(
+    pil_images: list[Image.Image], apply_attack: bool = False
+) -> torch.Tensor:
     """Returns (N, 2) softmax probabilities [P(REAL), P(FAKE)]."""
     tensors = torch.stack([_lnclip_preprocess(img) for img in pil_images])
     if apply_attack and _pgd_attack is not None:
@@ -178,33 +109,6 @@ def _run_lnclip(pil_images: list[Image.Image], apply_attack: bool = False) -> to
         tensors = _pgd_attack(tensors, labels)
     with torch.no_grad():
         return _lnclip(tensors).logits_labels.softmax(dim=1)
-
-
-def _reencode_h264(src: str) -> str:
-    """Re-encode mp4v → H.264 for browser playback. Falls back if ffmpeg absent."""
-    if not shutil.which("ffmpeg"):
-        return src
-    dst = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    dst.close()
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            src,
-            "-vcodec",
-            "libx264",
-            "-crf",
-            "23",
-            "-preset",
-            "fast",
-            "-pix_fmt",
-            "yuv420p",
-            dst.name,
-        ],
-        capture_output=True,
-    )
-    return dst.name if result.returncode == 0 else src
 
 
 def _to_label(probs: list[float]) -> dict:
@@ -220,10 +124,7 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
     if not cap.isOpened():
         return None, None, "Could not open video file."
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     # CAP_PROP_FRAME_COUNT is unreliable for webcam recordings — the container
     # header isn't written until the file is closed, so it often reads 0 or 1.
@@ -236,38 +137,22 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
         cap.release()
         cap = cv2.VideoCapture(video_path)
 
-    # Cap output resolution so the writer stays fast on HD+ webcam clips
-    out_scale = min(1.0, MAX_OUT_WIDTH / w)
-    out_w, out_h = int(w * out_scale), int(h * out_scale)
-
     # Sample BATCH_SIZE indices uniformly
     n_samples = min(BATCH_SIZE, max(total, 1))
     sample_idxs = set(np.linspace(0, total - 1, n_samples, dtype=int).tolist())
-
-    raw_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    writer = cv2.VideoWriter(
-        raw_tmp.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h)
-    )
 
     aligned_pils: list[Image.Image] = []
     spoof_results: list[tuple[bool, float]] = []
     frames_processed = 0
 
-    progress(0, desc="Annotating frames…")
+    progress(0, desc="Sampling frames…")
     while True:
         ret, bgr = cap.read()
         if not ret:
             break
 
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-        annotated = _annotate_rgb(rgb)
-        out_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
-        if out_scale < 1.0:
-            out_bgr = cv2.resize(out_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
-        writer.write(out_bgr)
-
         if frames_processed in sample_idxs:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             dlib_face = _get_largest_dlib_face(rgb)
             if dlib_face is not None:
                 spoof = _antispoof(rgb, dlib_face)
@@ -280,13 +165,9 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
 
         frames_processed += 1
         if total > 0:
-            progress(frames_processed / total * 0.80, desc="Annotating frames…")
+            progress(frames_processed / total * 0.90, desc="Sampling frames…")
 
     cap.release()
-    writer.release()
-
-    progress(0.85, desc="Re-encoding for browser…")
-    output_path = _reencode_h264(raw_tmp.name)
 
     label_out = None
     spoof_label_out = None
@@ -310,7 +191,7 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
     elif _lnclip is None:
         stats_parts.append("LNCLIP-DF model not loaded.")
     else:
-        progress(0.93, desc="Running LNCLIP-DF…")
+        progress(0.95, desc="Running LNCLIP-DF…")
         avg = _run_lnclip(aligned_pils, apply_attack=apply_attack).mean(dim=0).tolist()
         label_out = _to_label(avg)
         verdict = "FAKE" if avg[1] > 0.5 else "REAL"
@@ -319,7 +200,7 @@ def process_video(video_path: str, apply_attack: bool = False, progress=gr.Progr
         )
 
     progress(1.0)
-    return output_path, label_out, spoof_label_out, "\n".join(stats_parts)
+    return label_out, spoof_label_out, "\n".join(stats_parts)
 
 
 _status = (
@@ -337,12 +218,10 @@ with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
         f"probabilities for a video-level deepfake verdict."
     )
 
-    with gr.Row():
-        video_in = gr.Video(
-            sources=["webcam", "upload"],
-            label="Input — record or upload",
-        )
-        video_out = gr.Video(label="Annotated output", interactive=False)
+    video_in = gr.Video(
+        sources=["webcam", "upload"],
+        label="Input — record or upload",
+    )
 
     with gr.Row():
         analyze_btn = gr.Button("Analyze", variant="primary")
@@ -360,7 +239,7 @@ with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
     analyze_btn.click(
         fn=process_video,
         inputs=[video_in, attack_toggle],
-        outputs=[video_out, verdict_label, spoof_label, verdict_stats],
+        outputs=[verdict_label, spoof_label, verdict_stats],
     )
 
 

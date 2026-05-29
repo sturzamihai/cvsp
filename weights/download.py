@@ -6,6 +6,8 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
+import gdown
+
 
 def download_lnclip_df(repo_id="yermandy/deepfake-detection", filename="model.ckpt"):
     path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=".")
@@ -22,7 +24,7 @@ def download_dlib_predictor(
     return str(dst)
 
 
-def dowload_inswapper(
+def download_inswapper(
     url="https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx",
 ):
     dst = Path("inswapper_128.onnx")
@@ -30,11 +32,16 @@ def dowload_inswapper(
     return str(dst)
 
 
+def download_sac(gdrive_id="1yl_ZcrNFme_yP22UgynvG0fHtuy8XmcZ"):
+    return gdown.download(id=gdrive_id, output="sac.pth")
+
+
 if __name__ == "__main__":
     required_downloads = {
         "LNCLIP-DF": download_lnclip_df,
         "DLIB Shape Predictor": download_dlib_predictor,
-        "InSwapper 128": dowload_inswapper,
+        "InSwapper 128": download_inswapper,
+        "SAC": download_sac,
     }
 
     for key, value in required_downloads.items():

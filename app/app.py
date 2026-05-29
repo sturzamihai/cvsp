@@ -12,6 +12,7 @@ from PIL import Image
 try:
     import insightface
     from insightface.app import FaceAnalysis as InsightFaceAnalysis
+
     _insightface_available = True
 except ImportError:
     _insightface_available = False
@@ -22,11 +23,13 @@ sys.path.insert(0, str(ROOT))
 from cvsp.preprocessing import extract_aligned_face_dlib
 from cvsp.models.lnclip_df import load_model as load_lnclip_model
 from cvsp.models.minifas import FaceAntiSpoofing
+from cvsp.models.sac import load_model as load_sac_model
 
 import dlib
 
 PREDICTOR_PATH = ROOT / "weights" / "shape_predictor_81_face_landmarks.dat"
 LNCLIP_CKPT = ROOT / "weights" / "lnclip.ckpt"
+SAC_CKPT = ROOT / "weights" / "apricot_mask.pth"
 INSWAPPER_PATH = ROOT / "weights" / "inswapper_128.onnx"
 BATCH_SIZE = 48  # frames averaged per verdict
 
@@ -43,9 +46,16 @@ def _load_dlib():
     return detector, predictor
 
 
+_device = (
+    "mps"
+    if torch.backends.mps.is_available()
+    else ("cuda" if torch.cuda.is_available() else "cpu")
+)
+
 _detector, _predictor = _load_dlib()
 _lnclip, _lnclip_preprocess = load_lnclip_model(LNCLIP_CKPT)
 _antispoof = FaceAntiSpoofing()
+_sac, _sac_preprocess = load_sac_model(str(SAC_CKPT), device=_device)
 
 _fa_app = None
 _swapper = None
@@ -163,6 +173,7 @@ def process_video(
 
     aligned_pils: list[Image.Image] = []
     spoof_results: list[tuple[bool, float]] = []
+    sac_scores: list[float] = []
     frames_processed = 0
 
     progress(0, desc="Sampling frames…")
@@ -178,6 +189,13 @@ def process_video(
                     bgr = swapper.get(bgr, frame_faces[0], source_face, paste_back=True)
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            if _sac is not None:
+                detections = _sac(_sac_preprocess(rgb))
+                sac_scores.append(
+                    max(d["confidence"] for d in detections) if detections else 0.0
+                )
+
             dlib_face = _get_largest_dlib_face(rgb)
             if dlib_face is not None:
                 spoof = _antispoof(rgb, dlib_face)
@@ -195,10 +213,15 @@ def process_video(
 
     lnclip_label_out = None
     minifas_label_out = None
+    sac_label_out = None
 
     if spoof_results:
         avg_live = sum(score for _, score in spoof_results) / len(spoof_results)
         minifas_label_out = {"LIVE": avg_live, "SPOOF": 1.0 - avg_live}
+
+    if sac_scores:
+        patch_conf = sum(sac_scores) / len(sac_scores)
+        sac_label_out = {"PATCH": patch_conf, "CLEAN": 1.0 - patch_conf}
 
     if aligned_pils and _lnclip is not None:
         progress(0.85, desc="Running LNCLIP-DF...")
@@ -208,26 +231,15 @@ def process_video(
     progress(1.0)
 
     max_preview = 8
-    lnclip_preview = aligned_pils[::max(1, len(aligned_pils) // max_preview)][:max_preview]
+    lnclip_preview = aligned_pils[:: max(1, len(aligned_pils) // max_preview)][
+        :max_preview
+    ]
 
-    return lnclip_label_out, minifas_label_out, lnclip_preview
+    return lnclip_label_out, minifas_label_out, sac_label_out, lnclip_preview
 
-
-_status = (
-    f"dlib: **{'✓' if PREDICTOR_PATH.exists() else '✗ not found'}**  |  "
-    f"LNCLIP-DF: **{'✓' if _lnclip is not None else '✗ not loaded'}**  |  "
-    f"Deepfake swap: **{'✓' if _insightface_available and INSWAPPER_PATH.exists() else '✗ not available'}**"
-)
 
 with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
-    gr.Markdown(
-        "# DeepFakeBench Preprocessing + LNCLIP-DF Detection\n"
-        f"{_status}\n\n"
-        f"Record from your webcam or upload a video. "
-        f"The app samples **{BATCH_SIZE} frames uniformly**, aligns faces with the "
-        f"DFB similarity-transform pipeline, and averages LNCLIP-DF softmax "
-        f"probabilities for a video-level deepfake verdict."
-    )
+    gr.Markdown("# Computer Vision Spoofing Prevention System with AI\n")
 
     with gr.Row():
         video_in = gr.Video(
@@ -255,7 +267,10 @@ with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
 
     with gr.Row():
         verdict_label = gr.Label(num_top_classes=2, label="Deepfake (LNCLIP-DF)")
-        minifas_label = gr.Label(num_top_classes=2, label="Presentation Attack (MiniFAS)")
+        minifas_label = gr.Label(
+            num_top_classes=2, label="Presentation Attack (MiniFAS)"
+        )
+        sac_label = gr.Label(num_top_classes=2, label="Patch Attack (SAC)")
 
     lnclip_gallery = gr.Gallery(
         label="LNCLIP-DF aligned crops", columns=8, height=160, object_fit="cover"
@@ -270,7 +285,7 @@ with gr.Blocks(title="DeepFakeBench + LNCLIP-DF") as demo:
     analyze_btn.click(
         fn=process_video,
         inputs=[video_in, attack_toggle, deepfake_toggle, target_image],
-        outputs=[verdict_label, minifas_label, lnclip_gallery],
+        outputs=[verdict_label, minifas_label, sac_label, lnclip_gallery],
     )
 
 

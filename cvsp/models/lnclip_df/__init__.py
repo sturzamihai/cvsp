@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from cvsp.models.lnclip_df.model import DeepfakeDetectionModel
 from cvsp.models.lnclip_df.config import Config
@@ -9,6 +10,15 @@ _PRECISION_TO_DTYPE = {
     "16": torch.float16,
     "16-mixed": torch.float16,
 }
+
+
+class LogitsWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        return self.model(x).logits_labels
 
 
 def load_model(checkpoint_path, device="cpu"):

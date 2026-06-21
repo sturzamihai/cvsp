@@ -245,7 +245,7 @@ def main() -> None:
                 },
                 ckpt_path,
             )
-            logger.info(f"  ↳ new best val AUC={best_auc:.4f}, saved to {ckpt_path}")
+            logger.info(f"    new best val AUC={best_auc:.4f}, saved to {ckpt_path}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= args.patience:

@@ -11,14 +11,7 @@ from PIL import Image
 
 from cvsp.physical import PhysicalDefense
 from cvsp.digital import DigitalDefense
-
-try:
-    import insightface
-    from insightface.app import FaceAnalysis as InsightFaceAnalysis
-
-    _insightface_available = True
-except ImportError:
-    _insightface_available = False
+from attacks.deepfake import FaceSwap
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -39,21 +32,7 @@ _device = (
 
 _digital_defense = DigitalDefense(PREDICTOR_PATH, ADV_GUARD_CKPT, LNCLIP_CKPT)
 _physical_defense = PhysicalDefense(SAC_CKPT, _device)
-
-_fa_app = None
-_swapper = None
-
-
-def _get_deepfake_models():
-    global _fa_app, _swapper
-    if not _insightface_available:
-        return None, None
-    if _fa_app is None:
-        _fa_app = InsightFaceAnalysis()
-        _fa_app.prepare(ctx_id=0)
-    if _swapper is None and INSWAPPER_PATH.exists():
-        _swapper = insightface.model_zoo.get_model(str(INSWAPPER_PATH))
-    return _fa_app, _swapper
+_deepfake = FaceSwap(INSWAPPER_PATH)
 
 
 def process_video(
@@ -80,16 +59,8 @@ def process_video(
         cap.release()
         cap = cv2.VideoCapture(video_path)
 
-    source_face = None
-    fa_app = None
-    swapper = None
     if apply_deepfake and target_image is not None:
-        fa_app, swapper = _get_deepfake_models()
-        if fa_app is not None and swapper is not None:
-            target_bgr = cv2.cvtColor(target_image, cv2.COLOR_RGB2BGR)
-            faces = fa_app.get(target_bgr)
-            if faces:
-                source_face = faces[0]
+        _deepfake.prepare(target_image)
 
     n_samples = min(BATCH_SIZE, max(total, 1))
     sample_idxs = set(np.linspace(0, total - 1, n_samples, dtype=int).tolist())
@@ -105,16 +76,18 @@ def process_video(
             break
 
         if frames_processed in sample_idxs:
-            if source_face is not None:
-                frame_faces = fa_app.get(bgr)
-                if frame_faces:
-                    bgr = swapper.get(bgr, frame_faces[0], source_face, paste_back=True)
-
             sample_frames.append(bgr)
 
-            aligned_pils.append(
-                _digital_defense.get_aligned_face(bgr, input_is_bgr=True)
-            )
+            if apply_deepfake and _deepfake.ready:
+                bgr = _deepfake.apply(bgr)
+
+            aligned_face = _digital_defense.get_aligned_face(bgr, input_is_bgr=True)
+
+            if aligned_face and apply_attack:
+                pass  # TODO
+
+            if aligned_face:
+                aligned_pils.append(aligned_face)
 
         frames_processed += 1
         if total > 0:

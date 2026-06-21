@@ -19,130 +19,24 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from cvsp.models.lnclip_df import load_model as make_deepfake_model
+from attacks.adversarial_deepfake.preprocessing import (
+    NormalizeWrapper,
+    build_preprocess,
+    _CLIP_MEAN,
+    _CLIP_STD,
+)
+from attacks.adversarial_deepfake.attack import (
+    Attack,
+    FGSMAttack,
+    PGDAttack,
+    UniformNoiseAugmentation,
+    JPEGAugmentation,
+)
+from attacks.utils.fs import save_png, load_png_as_tensor
 
 EPS = 8 / 255
 ALPHA = 2 / 255
 PGD_STEPS = 25
-
-_CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
-_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
-
-
-class NormalizeWrapper(nn.Module):
-    def __init__(self, model: nn.Module, mean=_CLIP_MEAN, std=_CLIP_STD) -> None:
-        super().__init__()
-        self.model = model
-        self.register_buffer(
-            "mean", torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "std", torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = self.mean.to(x.device)
-        std = self.std.to(x.device)
-        x_norm = (x.float() - mean) / std
-        model_dtype = next(self.model.parameters()).dtype
-        return self.model(x_norm.to(model_dtype)).logits_labels.float()
-
-
-def build_preprocess() -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-        ]
-    )
-
-
-class Attack(ABC):
-    label: int
-
-    @abstractmethod
-    def apply(
-        self, imgs: torch.Tensor, labels: torch.Tensor
-    ) -> list[tuple[str, torch.Tensor]]: ...
-
-
-class FGSMAttack(Attack):
-    label = 1
-
-    def __init__(self, model: nn.Module, eps: float) -> None:
-        self._attack = torchattacks.FGSM(model, eps=eps)
-
-    def apply(self, imgs, labels):
-        adv = self._attack(imgs, labels)
-        return [("fgsm", adv[i]) for i in range(len(imgs))]
-
-
-class PGDAttack(Attack):
-    label = 1
-
-    def __init__(self, model: nn.Module, eps: float, alpha: float, steps: int) -> None:
-        self._attack = torchattacks.PGD(model, eps=eps, alpha=alpha, steps=steps)
-
-    def apply(self, imgs, labels):
-        adv = self._attack(imgs, labels)
-        return [("pgd", adv[i]) for i in range(len(imgs))]
-
-
-class UniformNoiseAugmentation(Attack):
-    label = 0
-    _levels = [2 / 255, 4 / 255, 8 / 255, 16 / 255]
-
-    def __init__(self) -> None:
-        self._counter = 0
-
-    def apply(self, imgs, _):
-        results = []
-        for img in imgs:
-            eps = self._levels[self._counter % len(self._levels)]
-            name = f"noise{int(round(eps * 255))}"
-            results.append(
-                (name, (img + torch.empty_like(img).uniform_(-eps, eps)).clamp(0, 1))
-            )
-            self._counter += 1
-        return results
-
-
-class JPEGAugmentation(Attack):
-    label = 0
-    _qualities = [95, 75, 50]
-
-    def __init__(self) -> None:
-        self._counter = 0
-
-    def apply(self, imgs, _):
-        results = []
-        for img in imgs:
-            quality = self._qualities[self._counter % len(self._qualities)]
-            results.append((f"jpeg{quality}", _jpeg_compress(img, quality)))
-            self._counter += 1
-        return results
-
-
-def _jpeg_compress(x: torch.Tensor, quality: int) -> torch.Tensor:
-    arr = _tensor_to_uint8(x).permute(1, 2, 0).cpu().numpy()
-    buf = io.BytesIO()
-    Image.fromarray(arr).save(buf, format="JPEG", quality=quality)
-    buf.seek(0)
-    return transforms.ToTensor()(Image.open(buf).convert("RGB"))
-
-
-def _tensor_to_uint8(t: torch.Tensor) -> torch.Tensor:
-    return (t.float() * 255).round().clamp(0, 255).to(torch.uint8)
-
-
-def save_png(tensor: torch.Tensor, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    arr = _tensor_to_uint8(tensor).permute(1, 2, 0).cpu().numpy()
-    Image.fromarray(arr).save(str(path), format="PNG")
-
-
-def load_png_as_tensor(path: Path) -> torch.Tensor:
-    return transforms.ToTensor()(Image.open(path).convert("RGB"))
 
 
 def collect_clips(celebdf_root: Path) -> list[tuple[Path, int]]:
@@ -257,7 +151,7 @@ def verify(
     with torch.no_grad():
         clean_preds = wrapped(imgs_t).argmax(dim=1).cpu()
     correct = (clean_preds == labels_t.cpu()).sum().item()
-    logger.info(f"[CHECK 4] Clean accuracy: {correct}/10  (need ≥8)")
+    logger.info(f"[CHECK 4] Clean accuracy: {correct}/10  (need >=8)")
     if correct < 8:
         logger.error(f"FAIL — only {correct}/10 correct")
         ok = False
@@ -286,7 +180,7 @@ def verify(
         )
         if pert > limit:
             logger.error(
-                f"FAIL — {attack_name.upper()} perturbation exceeds ε=8/255 in pixel space"
+                f"FAIL — {attack_name.upper()} perturbation exceeds eps=8/255 in pixel space"
             )
             ok = False
         else:
@@ -296,7 +190,7 @@ def verify(
             flips = (wrapped(adv_t).argmax(dim=1).cpu() != labels_t.cpu()).sum().item()
         min_flips = 4 if attack_name == "fgsm" else 7
         logger.info(
-            f"[CHECK 5] {attack_name.upper()} flips: {flips}/10  (need ≥{min_flips})"
+            f"[CHECK 5] {attack_name.upper()} flips: {flips}/10  (need >={min_flips})"
         )
         if flips < min_flips:
             logger.error(f"FAIL — {attack_name.upper()} flipped only {flips}/10")

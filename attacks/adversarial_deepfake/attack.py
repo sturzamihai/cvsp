@@ -82,3 +82,5 @@ class JPEGAugmentation(Attack):
             results.append((f"jpeg{quality}", self._jpeg_compress(img, quality)))
             self._counter += 1
         return results
+
+

@@ -19,6 +19,7 @@ class DigitalDefense:
     ):
         self.dlib_detector, self.dlib_predictor = self._load_dlib(dlib_predictor_path)
 
+        self.device = device
         self.adv_guard, self.adv_guard_preprocessing = load_adv_guard_model(
             adv_guard_checkpoint_path, device
         )
@@ -77,10 +78,10 @@ class DigitalDefense:
 
         lnclip_tensors = torch.stack(
             [self.lnclip_preprocessing(img) for img in aligned_faces]
-        )
+        ).to(self.device)
         adv_guard_tensors = torch.stack(
             [self.adv_guard_preprocessing(img) for img in aligned_faces]
-        )
+        ).to(self.device)
 
         with torch.no_grad():
             lnclip_score = self.lnclip(lnclip_tensors).logits_labels.softmax(dim=1)

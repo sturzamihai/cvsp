@@ -5,7 +5,14 @@ from cvsp.models.adv_guard.model import AdvGuard
 
 
 def _preprocessing(rgb):
-    transform = transforms.ToTensor()
+    transform = transforms.Compose(
+        [
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ]
+    )
+
     return transform(rgb)
 
 

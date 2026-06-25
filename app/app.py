@@ -12,6 +12,7 @@ from PIL import Image
 from cvsp.physical import PhysicalDefense
 from cvsp.digital import DigitalDefense
 from attacks.deepfake import FaceSwap
+from attacks.adversarial_deepfake import AdversarialFGSM
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -30,9 +31,10 @@ _device = (
     else ("cuda" if torch.cuda.is_available() else "cpu")
 )
 
-_digital_defense = DigitalDefense(PREDICTOR_PATH, ADV_GUARD_CKPT, LNCLIP_CKPT)
+_digital_defense = DigitalDefense(PREDICTOR_PATH, ADV_GUARD_CKPT, LNCLIP_CKPT, _device)
 _physical_defense = PhysicalDefense(SAC_CKPT, _device)
 _deepfake = FaceSwap(INSWAPPER_PATH)
+_adversarial_attack = AdversarialFGSM(_digital_defense.lnclip, _device)
 
 
 def process_video(
@@ -83,9 +85,6 @@ def process_video(
 
             aligned_face = _digital_defense.get_aligned_face(bgr, input_is_bgr=True)
 
-            if aligned_face and apply_attack:
-                pass  # TODO
-
             if aligned_face:
                 aligned_pils.append(aligned_face)
 
@@ -93,6 +92,10 @@ def process_video(
         if total > 0:
             progress(frames_processed / total * 0.20, desc="Sampling frames...")
     cap.release()
+
+    if apply_attack and aligned_pils:
+        progress(0.2, desc="Applying adversarial attack (FGSM)...")
+        aligned_pils = _adversarial_attack.apply(aligned_pils)
 
     progress(0.2, desc="Running digital defenses...")
     digital_scores = _digital_defense(aligned_pils, skip_alignment=True)
@@ -130,7 +133,7 @@ with gr.Blocks(title="Computer Vision Spoofing Prevention System with AI") as de
             attack_toggle = gr.Checkbox(
                 label="Apply adversarial attack",
                 value=False,
-                info="Applies PGD perturbation to sampled frames to evade the deepfake detector.",
+                info="Applies FGSM perturbation to sampled frames to evade the deepfake detector.",
             )
             deepfake_toggle = gr.Checkbox(
                 label="Apply deepfake",

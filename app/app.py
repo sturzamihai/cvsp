@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torchattacks
 from PIL import Image
+from deepface import DeepFace
 
 from cvsp.physical import PhysicalDefense
 from cvsp.digital import DigitalDefense
@@ -23,7 +24,7 @@ LNCLIP_CKPT = ROOT / "weights" / "lnclip.ckpt"
 ADV_GUARD_CKPT = ROOT / "weights" / "adv_guard.pt"
 SAC_CKPT = ROOT / "weights" / "apricot_mask.pth"
 INSWAPPER_PATH = ROOT / "weights" / "inswapper_128.onnx"
-BATCH_SIZE = 48
+BATCH_SIZE = 32
 
 _device = (
     "mps"
@@ -37,11 +38,22 @@ _deepfake = FaceSwap(INSWAPPER_PATH)
 _adversarial_attack = AdversarialFGSM(_digital_defense.lnclip, _device)
 
 
+def image_diff(orig, adv):
+    orig_arr = np.array(orig).astype(np.float32)
+    adv_arr = np.array(adv).astype(np.float32)
+
+    diff = adv_arr - orig_arr
+    EPS_U8 = AdversarialFGSM.EPS * 255 * 3
+    visible = np.clip((diff / EPS_U8) * 127.5 + 128, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(visible)
+
+
 def process_video(
     video_path: str,
-    apply_attack: bool = False,
-    apply_deepfake: bool = False,
-    target_image: np.ndarray | None = None,
+    apply_attack: bool,
+    apply_deepfake: bool,
+    target_image: np.ndarray,
     progress=gr.Progress(),
 ):
     if video_path is None:
@@ -66,7 +78,11 @@ def process_video(
 
     n_samples = min(BATCH_SIZE, max(total, 1))
     sample_idxs = set(np.linspace(0, total - 1, n_samples, dtype=int).tolist())
+
     sample_frames = []
+    deepfake_frames = []
+
+    verified = []
     frames_processed = 0
 
     aligned_pils = []
@@ -82,20 +98,44 @@ def process_video(
 
             if apply_deepfake and _deepfake.ready:
                 bgr = _deepfake.apply(bgr)
+                deepfake_frames.append(bgr)
 
             aligned_face = _digital_defense.get_aligned_face(bgr, input_is_bgr=True)
 
             if aligned_face:
                 aligned_pils.append(aligned_face)
 
+            result = DeepFace.verify(target_image, bgr, enforce_detection=False)
+            if result:
+                verified.append(result["verified"])
+
         frames_processed += 1
         if total > 0:
             progress(frames_processed / total * 0.20, desc="Sampling frames...")
     cap.release()
 
+    deepfake_slider = (
+        (None, None)
+        if deepfake_toggle == False
+        else (
+            cv2.cvtColor(sample_frames[0], cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(deepfake_frames[0], cv2.COLOR_BGR2RGB),
+        )
+    )
+
+    original_pils = aligned_pils.copy()
     if apply_attack and aligned_pils:
         progress(0.2, desc="Applying adversarial attack (FGSM)...")
         aligned_pils = _adversarial_attack.apply(aligned_pils)
+
+    adversarial_slider = (
+        (None, None)
+        if attack_toggle == False
+        else (
+            aligned_pils[0],
+            image_diff(original_pils[0].resize((224, 224)), aligned_pils[0]),
+        )
+    )
 
     progress(0.2, desc="Running digital defenses...")
     digital_scores = _digital_defense(aligned_pils, skip_alignment=True)
@@ -104,10 +144,7 @@ def process_video(
 
     progress(1.0)
 
-    max_preview = 8
-    face_gallery = aligned_pils[:: max(1, len(aligned_pils) // max_preview)][
-        :max_preview
-    ]
+    match_rate = sum(verified) / len(verified) if verified else 0.0
 
     return (
         {"REAL": digital_scores["deepfake"][0], "FAKE": digital_scores["deepfake"][1]},
@@ -117,19 +154,35 @@ def process_video(
         },
         {"REAL": physical_scores["spoofed"][0], "FAKE": physical_scores["spoofed"][1]},
         {"CLEAN": physical_scores["patch"][0], "ATTACKED": physical_scores["patch"][1]},
-        face_gallery,
+        {"MATCH": match_rate, "NO MATCH": 1.0 - match_rate},
+        deepfake_slider,
+        adversarial_slider,
     )
 
 
-with gr.Blocks(title="Computer Vision Spoofing Prevention System with AI") as demo:
+_FACE_VERIFY_CSS = """
+.face-verify-box {
+    border: 2px solid var(--primary-500) !important;
+    border-radius: 8px;
+    background: var(--primary-50);
+}
+"""
+
+with gr.Blocks(
+    title="Computer Vision Spoofing Prevention System with AI", css=_FACE_VERIFY_CSS
+) as demo:
     gr.Markdown("# Computer Vision Spoofing Prevention System with AI\n")
 
-    with gr.Row():
-        video_in = gr.Video(
-            sources=["webcam", "upload"],
-            label="Input — record or upload",
+    with gr.Row(equal_height=True):
+        target_image = gr.Image(
+            label="Target face",
+            type="numpy",
         )
         with gr.Column():
+            video_in = gr.Video(
+                sources=["webcam", "upload"],
+                label="Input — record or upload",
+            )
             attack_toggle = gr.Checkbox(
                 label="Apply adversarial attack",
                 value=False,
@@ -139,11 +192,6 @@ with gr.Blocks(title="Computer Vision Spoofing Prevention System with AI") as de
                 label="Apply deepfake",
                 value=False,
                 info="Swaps faces in the video with the target face using inswapper.",
-            )
-            target_image = gr.Image(
-                label="Target face",
-                type="numpy",
-                visible=False,
             )
 
     analyze_btn = gr.Button("Analyze", variant="primary")
@@ -158,15 +206,18 @@ with gr.Blocks(title="Computer Vision Spoofing Prevention System with AI") as de
         )
         patch_label = gr.Label(num_top_classes=2, label="Patch Attack (SAC)")
 
-    face_gallery = gr.Gallery(
-        label="Face aligned crops", columns=8, height=160, object_fit="cover"
-    )
+    with gr.Row():
+        face_verify_label = gr.Label(
+            num_top_classes=2,
+            label="Face Verification (DeepFace)",
+            elem_classes=["face-verify-box"],
+        )
 
-    deepfake_toggle.change(
-        fn=lambda enabled: gr.update(visible=enabled),
-        inputs=[deepfake_toggle],
-        outputs=[target_image],
-    )
+    with gr.Row():
+        deepfake_slider = gr.ImageSlider()
+
+    with gr.Row():
+        adversarial_slider = gr.ImageSlider()
 
     analyze_btn.click(
         fn=process_video,
@@ -176,7 +227,9 @@ with gr.Blocks(title="Computer Vision Spoofing Prevention System with AI") as de
             adversarial_label,
             spoofing_label,
             patch_label,
-            face_gallery,
+            face_verify_label,
+            deepfake_slider,
+            adversarial_slider,
         ],
     )
 

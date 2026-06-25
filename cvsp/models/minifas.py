@@ -4,7 +4,11 @@ from deepface import DeepFace
 class FaceAntiSpoofing:
     def __call__(self, image) -> tuple[bool, float] | None:
         """Returns (is_spoof, live_score) or None if no matching face found."""
-        faces = DeepFace.extract_faces(img_path=image, anti_spoofing=True)
+        faces = DeepFace.extract_faces(
+            img_path=image,
+            anti_spoofing=True,
+            enforce_detection=False,
+        )
 
         largest, largest_surface = None, 0.0
         for f in faces:

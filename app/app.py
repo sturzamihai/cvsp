@@ -114,28 +114,24 @@ def process_video(
             progress(frames_processed / total * 0.20, desc="Sampling frames...")
     cap.release()
 
-    deepfake_slider = (
-        (None, None)
-        if deepfake_toggle == False
-        else (
+    deepfake_slider = (None, None)
+    if apply_deepfake == True:
+        deepfake_slider = (
             cv2.cvtColor(sample_frames[0], cv2.COLOR_BGR2RGB),
             cv2.cvtColor(deepfake_frames[0], cv2.COLOR_BGR2RGB),
         )
-    )
 
     original_pils = aligned_pils.copy()
     if apply_attack and aligned_pils:
         progress(0.2, desc="Applying adversarial attack (FGSM)...")
         aligned_pils = _adversarial_attack.apply(aligned_pils)
 
-    adversarial_slider = (
-        (None, None)
-        if attack_toggle == False
-        else (
+    adversarial_slider = (None, None)
+    if apply_attack == True:
+        adversarial_slider = (
             aligned_pils[0],
             image_diff(original_pils[0].resize((224, 224)), aligned_pils[0]),
         )
-    )
 
     progress(0.2, desc="Running digital defenses...")
     digital_scores = _digital_defense(aligned_pils, skip_alignment=True)

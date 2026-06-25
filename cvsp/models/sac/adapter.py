@@ -25,8 +25,9 @@ class AdversarialPatchDetector:
             base_filter=base_filter,
             device=device,
         )
-        self.model.unet.to(device)
         self.model.unet.load_state_dict(ckpt)
+        self.model.unet.to(device)
+        self.model.unet.eval()
 
         self.open_kernel = np.ones((open_kernel_size, open_kernel_size), np.uint8)
         self.close_kernel = np.ones((close_kernel_size, close_kernel_size), np.uint8)
@@ -35,7 +36,8 @@ class AdversarialPatchDetector:
         self.min_fill_ratio = min_fill_ratio
 
     def __call__(self, inputs):
-        _, _, raw_masks = self.model(inputs, bpda=True, shape_completion=False)
+        with torch.no_grad():
+            _, _, raw_masks = self.model(inputs, bpda=True, shape_completion=False)
 
         mask_np = (raw_masks[0][0, 0].cpu().detach().numpy() * 255).astype(np.uint8)
 

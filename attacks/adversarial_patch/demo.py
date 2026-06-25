@@ -10,10 +10,11 @@ while True:
     if not ret:
         break
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    resized_frame = cv2.resize(frame, (854, 480))
+    rgb = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
     detections = model(preprocessing(rgb))
 
-    display = frame.copy()
+    display = resized_frame.copy()
     if detections:
         best = max(detections, key=lambda d: d["confidence"])
         bx, by, bw, bh = best["bbox"]

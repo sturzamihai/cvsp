@@ -221,3 +221,6 @@ __marimo__/
 
 # MacOS
 .DS_Store
+
+# Folder with demo videos/images
+/demo

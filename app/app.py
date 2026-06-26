@@ -114,11 +114,14 @@ def process_video(
             progress(frames_processed / total * 0.20, desc="Sampling frames...")
     cap.release()
 
-    deepfake_slider = (None, None)
-    if apply_deepfake == True:
-        deepfake_slider = (
-            cv2.cvtColor(sample_frames[0], cv2.COLOR_BGR2RGB),
-            cv2.cvtColor(deepfake_frames[0], cv2.COLOR_BGR2RGB),
+    deepfake_slider = gr.update(visible=False)
+    if apply_deepfake and deepfake_frames:
+        deepfake_slider = gr.update(
+            visible=True,
+            value=(
+                cv2.cvtColor(sample_frames[0], cv2.COLOR_BGR2RGB),
+                cv2.cvtColor(deepfake_frames[0], cv2.COLOR_BGR2RGB),
+            ),
         )
 
     original_pils = aligned_pils.copy()
@@ -126,11 +129,14 @@ def process_video(
         progress(0.2, desc="Applying adversarial attack (FGSM)...")
         aligned_pils = _adversarial_attack.apply(aligned_pils)
 
-    adversarial_slider = (None, None)
-    if apply_attack == True:
-        adversarial_slider = (
-            aligned_pils[0],
-            image_diff(original_pils[0].resize((224, 224)), aligned_pils[0]),
+    adversarial_slider = gr.update(visible=False)
+    if apply_attack and aligned_pils:
+        adversarial_slider = gr.update(
+            visible=True,
+            value=(
+                aligned_pils[0],
+                image_diff(original_pils[0].resize((224, 224)), aligned_pils[0]),
+            ),
         )
 
     progress(0.2, desc="Running digital defenses...")
@@ -210,10 +216,10 @@ with gr.Blocks(
         )
 
     with gr.Row():
-        deepfake_slider = gr.ImageSlider()
+        deepfake_slider = gr.ImageSlider(visible=False)
 
     with gr.Row():
-        adversarial_slider = gr.ImageSlider()
+        adversarial_slider = gr.ImageSlider(visible=False)
 
     analyze_btn.click(
         fn=process_video,

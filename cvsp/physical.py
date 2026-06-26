@@ -31,8 +31,7 @@ class PhysicalDefense:
         sac_scores = []
         spoof_scores = []
         for image in rgb_images:
-            with torch.no_grad():
-                sac_detection = self.sac(self.sac_preprocessing(image))
+            sac_detection = self.sac(self.sac_preprocessing(image))
             spoof_detection = self.antispoofing(image)
 
             sac_scores.append(
